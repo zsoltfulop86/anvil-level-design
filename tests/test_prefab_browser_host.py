@@ -1,9 +1,11 @@
 import os
+import shutil
 
 import bpy
 
 from .base_test import AnvilTestCase
 from ..operators import prefab_ops
+from ..prefabs import operators as prefab_operators
 
 
 def _new_asset_object(name):
@@ -53,11 +55,77 @@ class _FakeArea:
         self.spaces = _FakeSpaces(object())
 
 
+class _FakeFileItem:
+
+    def __init__(self, name):
+        self.name = name
+
+
 class PrefabBrowserHostTest(AnvilTestCase):
 
     def tearDown(self):
         bpy.context.scene.anvil_prefab_libraries.clear()
         super().tearDown()
+
+    def _prefab_selection_test_root(self):
+        root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "test_outputs", "prefab_folder_selection")
+        )
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def test_prefab_library_selection_recursively_reads_folder_blends(self):
+        root = self._prefab_selection_test_root()
+        nested = os.path.join(root, "nested")
+        os.makedirs(nested, exist_ok=True)
+        root_blend = os.path.join(root, "castle.blend")
+        nested_blend = os.path.join(nested, "props.blend")
+        ignored_file = os.path.join(root, "notes.txt")
+        try:
+            for filepath in (root_blend, nested_blend, ignored_file):
+                with open(filepath, "wb") as handle:
+                    handle.write(b"")
+
+            filepaths = prefab_operators._prefab_library_filepaths_from_selection(
+                root,
+                "",
+                [],
+            )
+
+            self.assertEqual(filepaths, [root_blend, nested_blend])
+        finally:
+            if os.path.isdir(root):
+                shutil.rmtree(root)
+
+    def test_prefab_library_selection_uses_dirpath_files_and_folder_items(self):
+        root = self._prefab_selection_test_root()
+        nested = os.path.join(root, "nested")
+        os.makedirs(nested, exist_ok=True)
+        root_blend = os.path.join(root, "castle.blend")
+        nested_blend = os.path.join(nested, "props.blend")
+        ignored_file = os.path.join(root, "notes.txt")
+        try:
+            for filepath in (root_blend, nested_blend, ignored_file):
+                with open(filepath, "wb") as handle:
+                    handle.write(b"")
+
+            filepaths = prefab_operators._prefab_library_filepaths_from_selection(
+                "",
+                root,
+                [
+                    _FakeFileItem("castle.blend"),
+                    _FakeFileItem("nested"),
+                    _FakeFileItem("notes.txt"),
+                    _FakeFileItem("castle.blend"),
+                ],
+            )
+
+            self.assertEqual(filepaths, [root_blend, nested_blend])
+        finally:
+            if os.path.isdir(root):
+                shutil.rmtree(root)
 
     def test_prefab_browser_window_marker_only_matches_marked_screens(self):
         marked_window = _FakeWindow()

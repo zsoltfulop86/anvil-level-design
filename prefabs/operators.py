@@ -5,8 +5,15 @@ import os
 import random
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty
-from bpy.types import Operator
+from bpy.props import (
+    BoolProperty,
+    CollectionProperty,
+    FloatProperty,
+    FloatVectorProperty,
+    IntProperty,
+    StringProperty,
+)
+from bpy.types import Operator, OperatorFileListElement
 from mathutils import Matrix, Vector
 
 from ..core.logging import debug_log
@@ -50,6 +57,68 @@ _PREFAB_UP_FALLBACK = Vector((0.0, 0.0, 1.0))
 _PREFAB_NORMAL_EPSILON = 0.000001
 _PREFAB_IDENTITY_SCALE = (1.0, 1.0, 1.0)
 _PREFAB_ZERO_ROTATION = (0.0, 0.0, 0.0)
+
+
+def _is_blend_filepath(filepath):
+    return (
+        bool(filepath)
+        and os.path.isfile(filepath)
+        and filepath.lower().endswith(".blend")
+    )
+
+
+def _prefab_blend_filepaths_in_folder(folder_path):
+    folder_path = normalize_path(folder_path)
+    if not os.path.isdir(folder_path):
+        return []
+
+    filepaths = []
+    for root, dirs, filenames in os.walk(folder_path):
+        dirs.sort(key=lambda name: name.lower())
+        for filename in sorted(filenames, key=lambda name: name.lower()):
+            filepath = normalize_path(os.path.join(root, filename))
+            if _is_blend_filepath(filepath):
+                filepaths.append(filepath)
+    return filepaths
+
+
+def _unique_prefab_library_filepaths(filepaths):
+    unique = []
+    seen = set()
+    for filepath in filepaths:
+        filepath = normalize_path(filepath)
+        key = os.path.normcase(filepath)
+        if not filepath or key in seen:
+            continue
+        seen.add(key)
+        unique.append(filepath)
+    return unique
+
+
+def _prefab_library_filepaths_from_selection(filepath, dirpath, files):
+    filepaths = []
+    selected_files = list(files) if files else []
+    base_dir = normalize_path(dirpath)
+
+    if selected_files and base_dir:
+        for file_item in selected_files:
+            name = getattr(file_item, "name", "")
+            candidate = normalize_path(os.path.join(base_dir, name))
+            if os.path.isdir(candidate):
+                filepaths.extend(_prefab_blend_filepaths_in_folder(candidate))
+            elif _is_blend_filepath(candidate):
+                filepaths.append(candidate)
+        return _unique_prefab_library_filepaths(filepaths)
+
+    selected_path = normalize_path(filepath)
+    if os.path.isdir(selected_path):
+        filepaths.extend(_prefab_blend_filepaths_in_folder(selected_path))
+    elif _is_blend_filepath(selected_path):
+        filepaths.append(selected_path)
+    elif base_dir:
+        filepaths.extend(_prefab_blend_filepaths_in_folder(base_dir))
+
+    return _unique_prefab_library_filepaths(filepaths)
 
 
 def _poll_level_design(context):
@@ -435,12 +504,14 @@ class LEVELDESIGN_OT_prefab_rotate_right(Operator):
 
 
 class LEVELDESIGN_OT_prefab_add_library(Operator):
-    """Add a .blend file as a prefab library"""
+    """Add .blend files or a folder of .blend files as prefab libraries"""
     bl_idname = "leveldesign.prefab_add_library"
     bl_label = "Add Library"
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: StringProperty(subtype='FILE_PATH')
+    dirpath: StringProperty(subtype='DIR_PATH')
+    files: CollectionProperty(type=OperatorFileListElement)
     filter_glob: StringProperty(default="*.blend", options={'HIDDEN'})
 
     @classmethod
@@ -453,25 +524,63 @@ class LEVELDESIGN_OT_prefab_add_library(Operator):
 
     def execute(self, context):
         scene = context.scene
-        abs_path = normalize_path(self.filepath)
-        if not abs_path or not os.path.isfile(abs_path):
-            self.report({'ERROR'}, "Pick a .blend file")
+        selected_paths = _prefab_library_filepaths_from_selection(
+            self.filepath,
+            self.dirpath,
+            self.files,
+        )
+        if not selected_paths:
+            self.report({'ERROR'}, "Pick a .blend file or a folder containing .blend files")
             return {'CANCELLED'}
 
-        for existing in scene.anvil_prefab_libraries:
-            if normalize_path(existing.filepath) == abs_path:
-                self.report({'WARNING'}, f"Library already added: {abs_path}")
-                return {'CANCELLED'}
+        existing_paths = {
+            os.path.normcase(normalize_path(existing.filepath))
+            for existing in scene.anvil_prefab_libraries
+        }
+        added_count = 0
+        skipped_count = 0
+        failed_paths = []
 
-        lib_entry = scene.anvil_prefab_libraries.add()
-        lib_entry.filepath = abs_path
-        if not refresh_library_objects(lib_entry):
-            scene.anvil_prefab_libraries.remove(len(scene.anvil_prefab_libraries) - 1)
-            self.report({'ERROR'}, f"Failed to read: {abs_path}")
+        for abs_path in selected_paths:
+            if os.path.normcase(abs_path) in existing_paths:
+                skipped_count += 1
+                continue
+
+            lib_entry = scene.anvil_prefab_libraries.add()
+            lib_entry.filepath = abs_path
+            if not refresh_library_objects(lib_entry):
+                scene.anvil_prefab_libraries.remove(len(scene.anvil_prefab_libraries) - 1)
+                failed_paths.append(abs_path)
+                continue
+
+            invalidate_preview_cache(abs_path)
+            existing_paths.add(os.path.normcase(abs_path))
+            scene.anvil_prefab_active_library_index = len(scene.anvil_prefab_libraries) - 1
+            added_count += 1
+
+        if added_count == 0:
+            if skipped_count > 0 and not failed_paths:
+                self.report({'WARNING'}, "Prefab libraries already added")
+            elif failed_paths:
+                self.report({'ERROR'}, f"Failed to read {len(failed_paths)} .blend file(s)")
+            else:
+                self.report({'ERROR'}, "No .blend files found")
             return {'CANCELLED'}
 
-        invalidate_preview_cache(abs_path)
-        scene.anvil_prefab_active_library_index = len(scene.anvil_prefab_libraries) - 1
+        message = f"Added {added_count} prefab librar"
+        if added_count == 1:
+            message += "y"
+        else:
+            message += "ies"
+        details = []
+        if skipped_count > 0:
+            details.append(f"skipped {skipped_count} duplicate")
+        if failed_paths:
+            details.append(f"failed {len(failed_paths)}")
+        if details:
+            self.report({'WARNING'}, f"{message}; {', '.join(details)}")
+        else:
+            self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
